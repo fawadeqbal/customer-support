@@ -1,0 +1,23 @@
+[project]
+name = "shopease-support-bot"
+version = "1.0.0"
+description = "RAG customer-support assistant: Flask API + LangGraph workflow + PostgreSQL/pgvector"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]            # read from requirements.txt (also used by the Dockerfile)
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["prompts/*.md", "db/migrations/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q -p no:flask"

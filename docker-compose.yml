@@ -1,0 +1,73 @@
+# Local services for the RAG bot: the database and (optionally) the local LLM.
+#   docker compose up -d                      database only (when backend/.env uses Claude or another API)
+#   docker compose --profile ollama up -d     database + local LLM (first time downloads the model ~2 GB)
+#   docker compose ps            postgres + ollama "healthy", ollama-pull "exited (0)" when the model is ready
+#   docker compose logs -f ollama-pull   watch the model download
+#   docker compose down          stop (data and models are kept)
+#   docker compose down -v       stop AND delete all data and downloaded models
+#
+# Change the model:  LLM_MODEL=qwen2.5:1.5b docker compose --profile ollama up -d   (and set LLM_MODEL in backend/.env)
+services:
+  postgres:
+    build: ./db
+    image: rag-postgres:16-alpine-pgvector
+    container_name: rag-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # The local LLM server (OpenAI-compatible API at http://localhost:11434/v1)
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    container_name: rag-ollama
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"        # only reachable from this computer
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "8192"    # room for the handbook passages + chat history
+      OLLAMA_KEEP_ALIVE: "24h"         # keep the model in memory between questions
+    volumes:
+      - ollama:/root/.ollama           # downloaded models survive restarts
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # NVIDIA GPU? Uncomment to make answers much faster (needs the NVIDIA container toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # Runs once: downloads the model into the ollama volume, then exits
+  ollama-pull:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    container_name: rag-ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull ${LLM_MODEL:-qwen2.5:3b} && echo 'model ready: ${LLM_MODEL:-qwen2.5:3b}'"]
+    restart: "no"
+
+volumes:
+  pgdata:
+  ollama:

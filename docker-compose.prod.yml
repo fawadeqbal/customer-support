@@ -1,0 +1,126 @@
+# Production stack for the server. Uses your existing nginx (chat-nest-nginx)
+# as the public entry point - nothing here is published to the internet.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+name: rag
+
+services:
+  rag-db:
+    build: ./db
+    image: rag-postgres:16-alpine-pgvector
+    container_name: rag-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ${RAG_DB_PASSWORD:?Set RAG_DB_PASSWORD in .env.prod}
+      POSTGRES_DB: rag
+    volumes:
+      - rag_pgdata:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 256m
+
+  rag-api:
+    build: ./backend
+    image: rag-api:latest
+    container_name: rag-api
+    restart: unless-stopped
+    env_file: .env.prod        # provider settings: LLM_PROVIDER, LLM_MODEL, EMBEDDING_* ... (docs/PROVIDERS.md)
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      DATABASE_URL: postgresql://rag:${RAG_DB_PASSWORD}@rag-db:5432/rag
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://rag-ollama:11434/v1}   # the local LLM container
+    depends_on:
+      rag-db:
+        condition: service_healthy
+    networks: [internal, proxy]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    mem_limit: 2g
+
+  rag-web:
+    build: ./frontend
+    image: rag-web:latest
+    container_name: rag-web
+    restart: unless-stopped
+    depends_on: [rag-api]
+    networks: [proxy]
+    mem_limit: 384m
+
+  # The local LLM (Ollama). Private network only - never published to the internet.
+  rag-ollama:
+    profiles: ["ollama"]               # started only when .env.prod uses ollama (deploy.sh decides)
+    image: ollama/ollama:latest
+    container_name: rag-ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "8192"
+      OLLAMA_KEEP_ALIVE: "24h"         # keep the model loaded between questions
+      OLLAMA_NUM_PARALLEL: "1"         # 2 CPU cores: answer one question at a time
+    volumes:
+      - rag_ollama:/root/.ollama
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    mem_limit: 5g
+
+  # Runs once per deploy: downloads the model if it isn't there yet, then exits
+  rag-ollama-pull:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    container_name: rag-ollama-pull
+    depends_on:
+      rag-ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://rag-ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull ${LLM_MODEL:-qwen2.5:3b}"]
+    networks: [internal]
+    restart: "no"
+
+  # Daily database backup, keeps the last 7 days in ./backups on the server
+  rag-backup:
+    image: rag-postgres:16-alpine-pgvector
+    container_name: rag-backup
+    restart: unless-stopped
+    environment:
+      PGPASSWORD: ${RAG_DB_PASSWORD}
+    volumes:
+      - ./backups:/backups
+    networks: [internal]
+    depends_on:
+      rag-db:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          f=/backups/rag-$$(date +%Y%m%d-%H%M).sql.gz
+          pg_dump -h rag-db -U rag rag | gzip > "$$f" && echo "backup saved: $$f"
+          find /backups -name 'rag-*.sql.gz' -mtime +7 -delete
+          sleep 86400
+        done
+    mem_limit: 128m
+
+networks:
+  internal:            # private: api, ollama, backup <-> database only
+  proxy:               # shared with chat-nest-nginx so it can reach rag-web and rag-api
+    external: true
+    name: chat-nest-backend_default
+
+volumes:
+  rag_pgdata:
+  rag_ollama:

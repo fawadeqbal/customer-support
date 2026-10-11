@@ -1,0 +1,15 @@
+anthropic
+python-dotenv
+flask
+flask-sock
+sentence-transformers
+langchain-text-splitters
+langchain-huggingface
+pdfplumber
+pytesseract
+numpy
+psycopg[binary]
+pgvector
+langgraph
+requests
+pydantic
