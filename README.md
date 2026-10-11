@@ -107,7 +107,7 @@ nginx block with a backup and `nginx -t` before reloading.
 
 ## Configuration
 
-| Setting (`backend/.env` / `.env.prod`) | Default | What it does |
+| Setting (`backend/.env` / `.env.prod`) | Used here | What it does |
 |---|---|---|
 | `LLM_PROVIDER`, `LLM_MODEL` | anthropic · claude-haiku-5-5 | The model that writes answers |
 | `ANTHROPIC_API_KEY` | - | Claude key |

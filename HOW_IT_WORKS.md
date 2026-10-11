@@ -1,274 +1,238 @@
-# How My RAG Chatbot Works (explained super simply)
+# How ShopEase Help works (explained simply)
 
-## The one-line idea
+This guide walks through the whole system in plain words: how the assistant learns the store's rules,
+how it answers, how it remembers a chat, and how a customer reaches a real person.
+Each part names the file that does the job, so you can open the code alongside.
+
+---
+
+## 1. The one-line idea
 
 > **RAG = before answering, look it up in the book.**
 
-Claude is very smart, but it has **never read ShopEase's rules**.
-So every time someone asks a question, we first **find the right page** in our rule book,
-then hand that page to Claude and say: *"Answer using this."*
+Claude is a very good writer, but it has never read ShopEase's rules. So for every question we first
+**find the right pages** in the store's handbook, then give those pages to Claude and say *"answer from this"*.
 
-That's it. That's RAG.
+- **R**etrieval: find the right pages
+- **A**ugmentation: put those pages into the question
+- **G**eneration: Claude writes the answer from them
 
-- **R**etrieval = find the right page
-- **A**ugmented = stick that page onto the question
-- **G**eneration = Claude writes the answer
+Think of a new shop helper with a rule book. Training would mean making them memorise every rule,
+and doing it again whenever a rule changes. RAG means handing them the book and saying "check before you answer".
+Change the book and they know the new rule straight away.
 
----
-
-## The story: a new shop helper
-
-Imagine you hire a very smart new helper for your shop. On day one:
-
-- They talk nicely and understand everything customers say. ✅
-- But they **don't know your shop's rules**: return days, delivery charges, nothing. ❌
-
-You have two choices:
-
-| Option | What you do | Problem |
+| | Training | RAG (this project) |
 |---|---|---|
-| **Training** (what you already know) | Make them memorize every rule | Slow and costly, and if a rule changes they must memorize again |
-| **RAG** (what we built) | Give them a **rule book** and say "check it before you answer" | Nothing! Change the book, and they instantly know the new rule |
-
-Our chatbot is that helper with a rule book.
-
-- The **helper** = Claude
-- The **rule book** = `support_knowledge.txt`
-- **Finding the right page fast** = the embedding model + FAISS
+| Where the knowledge lives | Inside the model | In a PDF next to the model |
+| A rule changes | Train again | Replace the PDF, run the ingest |
+| Shows where an answer came from | No | Yes, every answer lists its sources |
+| Makes things up | Can | Much less: "answer only from these pages" |
 
 ---
 
-## Part 1: Getting the book ready (happens once, when the server starts)
+## 2. Two moments: preparing the book, then answering
 
-Think of preparing a giant book so you can find anything in one second.
-
-### Step 1: Cut the book into small cards ✂️ (chunking)
-
-Our rule book is one long file. We cut it into **small cards**, one card per paragraph.
-
-```
-Card 1: "Return Policy: Most products can be returned within 7 days..."
-Card 2: "Delivery Charges: Delivery is free on orders of 1,500 PKR..."
-Card 3: "Forgot Password: Tap 'Forgot Password' on the login screen..."
-... 54 cards total
-```
-
-**Why cards?** Because when someone asks about returns, we want to give Claude **just the
-returns card**, not the whole book. Small cards = exact answers + fewer tokens.
-
-📄 Code: `knowledge_base.py` → the line that splits on `"\n\n"` (blank lines)
-
-### Step 2: Give every card a "meaning address" 📍 (embedding)
-
-This is the magic part.
-
-A special small model (`all-MiniLM-L6-v2`) reads each card and turns it into
-**384 numbers**. Think of these numbers as an **address on a map of meanings**.
-
-- Cards about **money back** live in the same neighborhood.
-- Cards about **delivery** live in another neighborhood.
-- Cards about **passwords** live far away from both.
-
-```
-            🗺️  The meaning map
-
-   [Refund timelines] [Return policy]        ← "money back" street
-        [Refund methods]
-
-                       [Delivery times] [Delivery charges]   ← "delivery" street
-
-  [Forgot password] [OTP not received]       ← "login" street
-```
-
-You already know this from training models: it's just a vector.
-**Similar meaning = vectors close together.**
-
-📄 Code: `knowledge_base.py` → `self._embed(...)`
-
-### Step 3: Put all addresses in a fast phone book 📒 (vector store)
-
-We store all 54 addresses in **FAISS**, which is like a phone book that can answer:
-*"Which cards live closest to this address?"* in milliseconds.
-
-📄 Code: `knowledge_base.py` → `faiss.IndexFlatIP(...)`
-
-When you start the server you see these three steps happen:
-```
-[1 chunk]  54 chunks
-[2 embed]  vectors shape = (54, 384)     ← 54 cards, 384 numbers each
-[3 store]  index ready
-```
-
----
-
-## Part 2: Answering a question (happens every time someone types)
-
-A customer types: **"Can I get my money back for earbuds?"**
-
-### Step 1: RETRIEVE: find the right cards 🔍
-
-1. We turn the **question** into an address too (same 384-number trick).
-2. We ask FAISS: *"Which cards live nearest to this question?"*
-3. FAISS returns the closest ones with a **closeness score** (0 = unrelated, 1 = same meaning):
-
-```
-0.62  Non-Returnable Items   ✅ very related
-0.55  Return Policy          ✅ related
-0.41  Refund Methods         ✅ related
-0.18  App Problems           ❌ thrown away (below 0.3)
-```
-
-Notice: the customer said **"money back"**, but the card says **"refund"**.
-It still found it, because embeddings match **meaning**, not exact words. 🎉
-
-We **throw away** cards scoring below **0.3** (`MIN_SCORE`), because they're noise.
-If you just say "hi", *no* card is close, so we send none (and save tokens).
-
-📄 Code: `knowledge_base.py` → `search()`
-
-### Step 2: AUGMENT: staple the cards to the question 📎
-
-We build one message for Claude that looks like this:
-
-```
-<context>
-Non-Returnable Items: ... earphones and earbuds once the seal is broken ...
-Return Policy: Most products can be returned within 7 days ...
-Refund Methods: ...
-</context>
-
-Question: Can I get my money back for earbuds?
-```
-
-Plus a **system prompt** (the helper's job description):
-*"You are ShopEase support. Answer ONLY from the context. Keep it short. Don't invent things."*
-
-📄 Code: `assistant.py` → `answer()` builds `prompt`
-
-### Step 3: GENERATE: Claude writes the answer ✍️
-
-Claude reads the cards and replies:
-
-> "Earbuds can't be returned once the seal is broken, unless they arrived damaged or wrong.
-> If that's the case, report it within 48 hours with photos."
-
-Claude didn't *know* this rule. It **read it from the card we gave it**.
-
-📄 Code: `assistant.py` → `client.messages.create(...)`
-
----
-
-## Part 3: Memory: how it remembers the chat 🧠
-
-Here's a surprising fact: **Claude has no memory between messages.**
-Every request is like meeting a person with total amnesia. 🐟
-
-So how does the chat "remember"? **We cheat:** every time, we send the earlier
-conversation along with the new question.
-
-```
-Message 1 sent:  [Q1]
-Message 2 sent:  [Q1] [A1] [Q2]
-Message 3 sent:  [Q1] [A1] [Q2] [A2] [Q3]
-```
-
-It's like handing the amnesia helper a **notebook of everything said so far**
-before each new question.
-
-- The **browser** keeps the notebook (each chat in the sidebar is its own notebook).
-- We only send the **last 4 back-and-forths**, and shorten long old answers,
-  because a bigger notebook costs more tokens. 💸
-
-📄 Code: `page.js` sends `history` → `app.py` → `assistant.py` → `_trim_history()`
-
----
-
-## The whole picture 🖼️
-
-```
- YOU type in the browser
-        │
-        ▼
- ┌────────────────────┐   frontend/app/page.js
- │  Next.js chat page │   (shows chat, keeps the notebook/history)
- └─────────┬──────────┘
-           │  POST /api/chat  { message, history }
-           ▼
- ┌────────────────────┐   first from scratch/app.py
- │    Flask server    │   (the waiter: takes the order, brings the food)
- └─────────┬──────────┘
-           │
-   1. RETRIEVE ─────────▶ knowledge_base.py   find nearest cards (FAISS)
-           │
-   2. AUGMENT  ─────────▶ assistant.py        staple cards to question
-           │
-   3. GENERATE ─────────▶ Claude API          write the answer
-           │
-           ▼
-   { answer, sources, usage }  back to the browser
-           │
-           ▼
- Chat shows the answer + "Answer based on" cards + token count
-```
-
----
-
-## What each file is (the cast of characters 🎭)
-
-| File | Who it is in the story | Job |
+| | When | Command |
 |---|---|---|
-| `support_knowledge.txt` | 📕 The rule book | All of ShopEase's policies |
-| `config.py` | 🎛️ The control panel | All settings in one place |
-| `knowledge_base.py` | 📚 The librarian | Cuts cards, gives addresses, finds nearest cards |
-| `assistant.py` | ✍️ The writer | Builds the prompt, asks Claude, counts tokens |
-| `app.py` | 🍽️ The waiter | Flask API: browser ↔ librarian + writer |
-| `main.py` | 💻 Terminal version | Same flow, but in the terminal, no website |
-| `frontend/app/page.js` | 🪟 The shop window | The chat screen the customer sees |
-| `frontend/next.config.mjs` | 🚪 The hallway | Sends `/api/...` from the website to Flask |
-| `.env` | 🔑 The key | Your Claude API key (never share it!) |
+| **Ingest**: read the PDF into the knowledge base | Once, and again when the PDF changes | `python -m scripts.ingest` |
+| **Answer**: every message a customer sends | All the time | `python -m app.main` |
 
 ---
 
-## The knobs you can turn 🎛️ (all in `config.py`)
+## 3. Preparing the book (ingest)
+
+The handbook is `backend/data/shopease_support_handbook.pdf`: 11 pages, 9 chapters
+(account, orders, delivery, payments, returns, warranty, offers, and support tickets).
+
+```
+PDF ──► read ──► clean ──► cut into passages ──► turn into numbers ──► save in Postgres
+```
+
+1. **Read** (`app/rag/ingestion/loaders.py`). pdfplumber takes the text from each page. Tables become
+   small text tables so prices stay on their rows. A scanned page with no text is read with OCR.
+2. **Clean** (`cleaning.py`). The line repeated at the top or bottom of every page
+   ("ShopEase Customer Support Handbook · Page 3") is removed, and broken lines are joined into sentences.
+3. **Cut into passages** (`chunking.py`). Every heading starts a new passage, so one passage = one policy
+   ("Return Policy", "Delivery Charges", "Waiting in the Support Queue"). The result is **63 passages**.
+4. **Turn into numbers**. A small multilingual model turns each passage into **384 numbers** that capture
+   its meaning. Passages about money back end up close together; passages about passwords end up far away.
+   It runs on your own computer, so it costs nothing.
+5. **Save** (`app/stores/pgvector.py`). Each passage goes into a Postgres table with its 384 numbers
+   (for meaning search) and a keyword index (for exact-word search).
+
+---
+
+## 4. Answering a question
+
+Every message goes through a small workflow built with **LangGraph** (`app/graph/`).
+Each box is one step; the diamonds are decisions.
+
+```mermaid
+flowchart TD
+  M([message]) --> LM[load memory]
+  LM --> CL[classify]
+  CL --> D{what kind?}
+  D -- "wants a person" --> HO[handoff: show the ticket form]
+  D -- "hi / thanks" --> GEN[generate]
+  D -- "a question" --> RW[rewrite]
+  RW --> RT[retrieve]
+  RT --> F{found passages?}
+  F -- yes --> GEN
+  F -- "no, first try" --> BR[broaden]
+  BR --> RT
+  GEN --> SV[save]
+  HO --> SV
+```
+
+| Step | What happens | Uses Claude? |
+|---|---|---|
+| **load memory** | Gets the last 4 turns of this chat and a short summary of anything older | no |
+| **classify** | Simple patterns: a greeting skips the search; "talk to a person" goes to handoff | no |
+| **rewrite** | A follow-up ("how long does *it* take?") or Urdu becomes a clear English search query | small call, only when needed |
+| **retrieve** | Finds the 4 best passages (next section) | no |
+| **broaden** | Nothing matched: rephrase and search again, a little wider (once) | small call |
+| **generate** | Claude answers from the passages, can use tools, and the answer streams in word by word | yes |
+| **handoff** | Replies "please fill in the form below" and the chat panel shows the ticket form | no |
+| **save** | Stores the question and answer with sources and token usage | summary in the background |
+
+### Finding the right passages (retrieve)
+
+Two searches run together, because each catches what the other misses:
+
+- **Meaning search** (pgvector) knows "money back" is close to "refund".
+- **Keyword search** (Postgres full-text) reliably catches exact words like "COD" or "PTA".
+
+```
+query ─┬─► meaning search (20) ─┐
+       └─► keyword search (20) ─┴─► merge (rank fusion) ─► drop weak ones (< 0.3) ─► rerank ─► top 4
+```
+
+The **reranker** is a second small model that reads the question and each passage together. It is slower but
+more accurate, so it only looks at the few that are left. Code: `app/rag/retrieval.py`.
+
+### Writing the answer (generate)
+
+Claude gets the 4 passages, the recent chat and the question, plus rules from `app/prompts/system.md`:
+answer only from the passages, keep it short, reply in the customer's language, never invent policies.
+
+Claude also has two **tools** (`app/tools/`):
+
+| Tool | When Claude uses it | What happens |
+|---|---|---|
+| `lookup_order` | The customer gives an order number like SE10482931 | Reads the live status from the `orders` table |
+| `open_support_ticket` | The customer wants a person, or the handbook says the problem needs staff (late refund, damaged item, complaint) | The chat panel shows the ticket form under the answer |
+
+### Watching it live
+
+The answer is not sent all at once. Flask keeps the connection open and sends small events as each step
+finishes (Server-Sent Events): `step` (which step is running), `meta` (the passages found), `tool`,
+`delta` (the next few words) and `done`. That drives the live trace and the typing effect in the chat.
+
+---
+
+## 5. Memory: how it remembers the chat
+
+Claude remembers nothing between calls. So every time, we send the memory along, kept small to save tokens:
+
+- the **last 4 turns** word for word (long old answers are cut to 600 characters)
+- a **running summary** of everything older, updated in the background after each answer
+
+There are no accounts. The browser makes a random **visitor id** and sends it with every request, and the
+API only shows that visitor their own chats and tickets. Everything is stored in Postgres:
+
+| Table | Holds |
+|---|---|
+| `chunks` | the 63 handbook passages with their numbers |
+| `conversations` | one row per chat: title, visitor id, running summary |
+| `messages` | every message: customer, assistant, agent or system line, with sources, usage, feedback and time |
+| `handoffs` | support tickets: status, customer name, email, issue, agent, times |
+| `ticket_files` | files attached to tickets |
+| `orders` | demo orders SE10482931 to SE10482936 |
+
+Tables are created and upgraded by numbered files in `app/db/migrations/` when the API starts.
+
+---
+
+## 6. Talking to a person (support tickets)
+
+When a customer asks for a person (or Claude decides they need one):
+
+```
+"talk to a person" ─► ticket form ─► queue (No. 2, about 6 min) ─► agent joins ─► chat ─► agent closes ─► bot again
+```
+
+1. **The form.** The chat shows a short form: name, email, issue (pre-filled with their last question) and up
+   to 3 files (images, PDF or text, 5 MB each). Name and email are remembered for next time.
+2. **The queue.** Sending it creates a ticket (e.g. SE-48012) and the customer sees their place in line:
+   *"All agents are busy. You're number 2 in line · about 6 mins"*. Each agent handles one chat at a time,
+   so the estimate is: people ahead ÷ agents on shift × the average chat length (starts at 5 minutes,
+   then uses real closed tickets). Code: `app/support/desk.py`.
+3. **The agent.** In `/admin` the agent signs in with their name and the admin token, sees the queue, opens the
+   ticket (name, email, issue and files on top, the earlier bot chat below) and clicks **Take ticket**.
+   The customer sees "Ali joined the chat".
+4. **Chatting.** While a person handles the chat, the customer's messages go to the agent, not the bot.
+   Both sides see "… is typing" and every message has its time.
+5. **Closing.** The agent clicks **Close ticket** (or the customer clicks **Leave queue** / **End chat**) and the
+   bot starts answering again.
+
+### Why it feels instant: WebSockets
+
+The chat panel and `/admin` each keep a WebSocket open (`/ws/support`, `/ws/admin`, in `app/api/live.py`).
+When anything changes (a ticket opens, an agent joins, a message or a typing signal), the server pushes it
+straight away through a small in-memory message bus (`app/realtime/hub.py`). If the connection drops, the page
+reconnects by itself and checks every 3 seconds in the meantime, so nothing is missed.
+
+---
+
+## 7. Which part does what
+
+| Where | Job |
+|---|---|
+| `backend/data/*.pdf` | The handbook: the store's knowledge |
+| `backend/app/rag/ingestion/` | Read, clean and cut the PDF into passages |
+| `backend/app/rag/retrieval.py` | Find the best passages (hybrid search + rerank) |
+| `backend/app/rag/generation.py` | Ask Claude: rewrite queries, stream answers, run tools, summarise |
+| `backend/app/graph/` | The LangGraph workflow: steps and decisions |
+| `backend/app/support/desk.py` | Tickets and the queue: open, take, reply, close, wait estimate |
+| `backend/app/api/` | HTTP routes, SSE streaming, WebSockets, admin endpoints |
+| `backend/app/providers/` | Swappable models: Claude, Ollama, OpenAI-compatible, local embeddings |
+| `backend/app/prompts/*.md` | What the assistant is told, in plain text files |
+| `frontend/app/page.js` | The store page with the "How it works" section |
+| `frontend/app/components/SupportWidget.js` | The chat panel: answers, sources, ticket form, queue, agent chat |
+| `frontend/app/admin/` | The agent console |
+| `deploy.sh` | Puts everything on the server in one command |
+
+---
+
+## 8. Knobs you can turn (`backend/app/core/config.py` or `.env`)
 
 | Setting | Now | Turn it up | Turn it down |
 |---|---|---|---|
-| `TOP_K` | 4 | More cards → more context, more tokens | Fewer cards → might miss info |
-| `MIN_SCORE` | 0.3 | Stricter → only very related cards | Looser → more cards, more noise |
-| `MEMORY_TURNS` | 4 | Remembers longer chats, costs more | Cheaper, forgets sooner |
-| `MAX_ANSWER_TOKENS` | 300 | Longer answers allowed | Shorter, cheaper answers |
-| `LLM_MODEL` | Haiku | Sonnet = smarter, pricier | Haiku = fast, cheap |
+| `TOP_K` | 4 | More passages, more tokens | Might miss information |
+| `MIN_SCORE` | 0.3 | Only very close passages | More passages, more noise |
+| `MEMORY_TURNS` | 4 | Remembers longer, costs more | Cheaper, forgets sooner |
+| `LLM_MODEL` | Haiku | Sonnet or Opus: smarter, pricier | Haiku: fast and cheap |
+| `SUPPORT_AGENTS` | 2 | Shorter queue estimates | Longer estimates |
+| `DAILY_REQUEST_CAP` | 400 | More bot answers a day | Protects the API bill |
 
 ---
 
-## RAG vs training: the cheat sheet
+## 9. Try these to see it working
 
-| | Training / fine-tuning | RAG |
-|---|---|---|
-| Where knowledge lives | Inside the model's weights 🧠 | In a book next to the model 📕 |
-| New rule? | Retrain 😩 | Edit the text file 😎 |
-| Can show where the answer came from? | No | Yes ("Answer based on...") |
-| Stops making things up? | Not really | Much better: "answer ONLY from the cards" |
-| Best for | Teaching **how** to talk | Teaching **what** to know |
-
----
-
-## Try these to *see* RAG working 🧪
-
-1. **Change the book:** add a paragraph to `support_knowledge.txt`, e.g.
-   `Dress Code: Our riders wear blue uniforms.` Restart Flask.
-   Ask "what do riders wear?". It knows instantly. No training!
-2. **Ask with different words:** "my thing broke, can I swap it?" and watch it still find the right cards.
-3. **Ask something not in the book:** "who is the CEO?" No good cards, so it politely says it doesn't know.
-4. **Watch the tokens:** say "hi" (tiny count) vs. a long chat (bigger count, because of the notebook).
-5. **Set `TOP_K = 1`** and ask a question that needs two cards. Watch the answer get worse.
+1. **Different words, same meaning:** "my thing broke, can I swap it?" still finds the returns policy.
+2. **Urdu:** "refund kitne din mein milta hai?" gets rewritten to English for the search, answered in Urdu.
+3. **An order:** "where is my order SE10482931?" makes Claude call `lookup_order`.
+4. **Not in the book:** "who is the CEO?" widens the search once, then offers to connect you to the team.
+5. **A person:** "I want to talk" shows the ticket form; open `/admin` in another window and take the ticket.
+6. **Change the book:** edit the PDF, run `python -m scripts.ingest`, ask about the change. No training needed.
+7. **Measure retrieval:** `python -m scripts.evaluate --sweep` scores the search on 35 test questions.
 
 ---
 
-## Remember these 5 sentences and you understand RAG 🏁
+## 10. Five sentences to remember
 
-1. Claude is smart but **doesn't know your data**.
-2. We **cut** our data into cards and give each card a **meaning address** (embedding).
-3. For each question, we **find the closest cards** (retrieve).
-4. We **staple those cards to the question** (augment) and Claude **answers from them** (generate).
-5. Claude has **no memory**, so we **resend the recent chat** every time.
+1. Claude is smart but doesn't know the store's rules, so we give it the right pages for every question.
+2. The PDF is cut into one passage per policy, and each passage gets a "meaning address" of 384 numbers.
+3. Meaning search and keyword search together, then a reranker, pick the best 4 passages.
+4. Claude answers only from them, uses tools for live orders and for handing over to a person, and remembers the chat because we resend it.
+5. When a person is needed, a ticket joins a live queue and an agent takes over in the same chat, in real time.
